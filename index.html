@@ -1,0 +1,504 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>积水夜跑</title>
+<style>
+  html,body{margin:0;height:100%;background:#02060f;overflow:hidden}
+  canvas{display:block}
+  #hint{position:fixed;left:50%;top:14%;transform:translate(-50%,8px);color:#d8ecff;font:500 20px/1.6 'PingFang SC',sans-serif;letter-spacing:.18em;text-align:center;
+    text-shadow:0 0 18px rgba(80,170,255,.8);opacity:0;transition:opacity 1.2s,transform 1.2s;pointer-events:none;z-index:5}
+  #hint.on{opacity:.92;transform:translate(-50%,0)} #hint small{display:block;font-size:13px;letter-spacing:.3em;opacity:.65;margin-top:6px}
+  #legal{position:fixed;right:12px;bottom:8px;max-width:46ch;color:#9fb8d8;opacity:.4;font:11px/1.5 -apple-system,'PingFang SC',sans-serif;text-align:right;z-index:6}
+  #tip{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);color:#cfe3ff;opacity:.55;
+    font:13px/1.4 -apple-system,"PingFang SC",sans-serif;letter-spacing:.15em;pointer-events:none;transition:opacity 2s}
+</style>
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+"three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}
+</script>
+</head>
+<body>
+<div id="hint"></div>
+<div id="legal">水下角色画面为致敬吉卜力工作室动画的同人创作，相关角色版权归原作者所有。本作品仅供个人学习与娱乐体验，非商业用途；如有侵权请联系删除。</div>
+<div id="tip">按 ↑ 起跑（开启声音）· 方向键 / 鼠标 控制方向 · 空格 停下</div>
+<script type="module">
+import * as THREE from 'three';
+import {EffectComposer} from 'three/addons/postprocessing/EffectComposer.js';
+import {RenderPass} from 'three/addons/postprocessing/RenderPass.js';
+import {UnrealBloomPass} from 'three/addons/postprocessing/UnrealBloomPass.js';
+import {ShaderPass} from 'three/addons/postprocessing/ShaderPass.js';
+import {OutputPass} from 'three/addons/postprocessing/OutputPass.js';
+import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
+import * as SkeletonUtils from 'three/addons/utils/SkeletonUtils.js';
+
+const renderer = new THREE.WebGLRenderer({antialias:true, preserveDrawingBuffer:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.setSize(innerWidth,innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;renderer.toneMappingExposure=.9;
+renderer.toneMappingExposure = 1.1;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(32, innerWidth/innerHeight, 0.1, 200);
+
+scene.add(new THREE.HemisphereLight(0x6f9cff, 0x061428, 0.55));
+const rim = new THREE.DirectionalLight(0x8fb6ff, 1.2); rim.position.set(2,6,-5); scene.add(rim); scene.add(rim.target);
+const moon = new THREE.DirectionalLight(0x9fc4ff, 0.5); moon.position.set(-3,10,-4); scene.add(moon);
+
+/* ---------------- 水面 ---------------- */
+const NR = 48;
+const ripples = Array.from({length:NR},()=>new THREE.Vector4(0,0,-99,0));
+let ripIdx = 0;
+let simT=0;
+function addRipple(x,z,s){ ripples[ripIdx].set(x,z,simT,s); ripIdx=(ripIdx+1)%NR; }
+
+const waterMat = new THREE.ShaderMaterial({
+  uniforms:{uTime:{value:0},uRip:{value:ripples},uLamp:{value:new THREE.Vector3()},uGirl:{value:new THREE.Vector3()},uCam:{value:new THREE.Vector3()},
+    uImgA:{value:null},uImgB:{value:null},uAncA:{value:new THREE.Vector2()},uAncB:{value:new THREE.Vector2()},uFA:{value:0},uFB:{value:0},uImgSize:{value:20}},
+  vertexShader:`varying vec3 vW; void main(){ vec4 w=modelMatrix*vec4(position,1.); vW=w.xyz; gl_Position=projectionMatrix*viewMatrix*w; }`,
+  fragmentShader:`
+  #define NR ${NR}
+  uniform float uTime; uniform vec4 uRip[NR]; uniform vec3 uLamp,uGirl,uCam; varying vec3 vW;
+  uniform sampler2D uImgA,uImgB; uniform vec2 uAncA,uAncB; uniform float uFA,uFB,uImgSize;
+  float fbm(vec2 p);
+  vec4 img(sampler2D t, vec2 anc, vec2 q, float f){ vec2 d=(q-anc)/uImgSize; vec2 uv=vec2(.5+d.x,.5-d.y);
+    float edge=smoothstep(.5,.3,length(d)*0.92);
+    float n=fbm(q*.35+anc)*.7+length(d)*.9;          // 墨晕：从中心向外、沿噪声纹理晕开
+    edge*=smoothstep(n-.18,n+.05,f*1.75-.1);
+    vec3 c=texture2D(t,clamp(uv,0.,1.)).rgb; c=pow(c,vec3(1.1))*vec3(.8,.88,.98);
+    return vec4(c,edge); }
+  float hash(vec2 p){ p=fract(p*vec2(123.34,456.21)); p+=dot(p,p+45.32); return fract(p.x*p.y); }
+  vec2 hash2(vec2 p){ return vec2(hash(p),hash(p+17.1)); }
+  float noise(vec2 p){ vec2 i=floor(p),f=fract(p); f=f*f*(3.-2.*f);
+    return mix(mix(hash(i),hash(i+vec2(1,0)),f.x),mix(hash(i+vec2(0,1)),hash(i+1.),f.x),f.y); }
+  float fbm(vec2 p){ float s=0.,a=.5; for(int i=0;i<5;i++){ s+=a*noise(p); p=p*2.03+7.1; a*=.5;} return s; }
+
+  float height(vec2 p){
+    float s=0.;
+    for(int i=0;i<NR;i++){ vec4 r=uRip[i]; float age=uTime-r.z; if(age<0.||age>5.) continue;
+      float d=length(p-r.xy); float fr=age*1.35;
+      float env=exp(-abs(d-fr)*2.6)*exp(-age*.9)*r.w/(1.+d*1.5);
+      s+=sin((d-fr)*24.)*env;
+      s-=exp(-d*d*60.)*exp(-age*9.)*r.w*1.6; }           // 踩下去的瞬间凹坑
+    s+= (noise(p*3.+uTime*.25)-.5)*.05 + (noise(p*9.-uTime*.4)-.5)*.03 + (noise(p*26.+uTime*.9)-.5)*.012;
+    return s*.085;
+  }
+  float foam(vec2 p){ float f=0.;
+    for(int i=0;i<NR;i++){ vec4 r=uRip[i]; float age=uTime-r.z; if(age<0.||age>1.6) continue;
+      float d=length(p-r.xy); float fr=age*1.35+.04;
+      float ring=exp(-abs(d-fr)*28.)*exp(-age*2.6);
+      float core=exp(-d*d*90.)*exp(-age*6.);
+      f+=(ring*(.55+.45*noise(p*40.+r.z))+core)*r.w; }
+    return f;
+  }
+  // 积水下的星空
+  vec3 stars(vec2 p, float scale){
+    vec2 g=p*scale, i=floor(g), f=fract(g); vec2 o=hash2(i);
+    float d=length(f-o); float b=hash(i+3.);
+    float tw=.6+.4*sin(uTime*(1.+b*3.)+b*40.);
+    return vec3(.8,.9,1.)*smoothstep(.06*b,.0,d)*step(.55,b)*tw*2.;
+  }
+  vec3 galaxy(vec2 p){
+    float n=fbm(p*.12+vec2(uTime*.01,0.)); float m=fbm(p*.3-n*2.);
+    vec3 c=mix(vec3(.01,.03,.12),vec3(.08,.2,.55),smoothstep(.3,.8,n));
+    c+=vec3(.5,.25,.7)*pow(m,4.)*.9;
+    c+=stars(p,3.)+stars(p+9.,7.)*.6+stars(p+3.,14.)*.35;
+    return c;
+  }
+  // 沉没的灯火小镇
+  vec3 town(vec2 p){
+    vec2 g=p*vec2(.9,1.3); vec2 i=floor(g), f=fract(g);
+    float on=step(.62,hash(i)); float flick=.75+.25*sin(uTime*2.+hash(i+1.)*30.);
+    vec2 q=abs(f-.5); float win=smoothstep(.32,.22,max(q.x*1.3,q.y));
+    float glow=exp(-length(f-.5)*3.5);
+    vec3 warm=mix(vec3(1.,.55,.18),vec3(1.,.8,.45),hash(i+5.));
+    vec3 c=vec3(.01,.025,.06)+warm*on*flick*(win*.8+glow*.2);
+    float street=smoothstep(.06,.0,abs(fract(p.y*.25)-.5))*.15;
+    return c+vec3(.9,.6,.3)*street+stars(p,5.)*.3;
+  }
+  // 发光珊瑚 / 水母
+  vec3 coral(vec2 p){
+    vec2 g=p*.8, i=floor(g), f=fract(g); float md=8.,md2=8.;
+    for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){ vec2 b=vec2(x,y); vec2 o=hash2(i+b);
+      o=.5+.4*sin(uTime*.4+6.28*o); float d=length(b+o-f); if(d<md){md2=md;md=d;}else if(d<md2)md2=d; }
+    float edge=smoothstep(.08,.0,md2-md);
+    float core=smoothstep(.25,.0,md)*(.5+.5*sin(uTime*1.5+hash(i)*20.));
+    vec3 c=vec3(.0,.03,.06)+vec3(.1,.9,.85)*edge*.55+vec3(.6,.4,1.)*core*.7;
+    return c+stars(p,6.)*.4;
+  }
+  vec3 under(vec2 p){
+    float r=fbm(p*.025+3.);
+    vec3 a=galaxy(p), b=town(p), c=coral(p);
+    vec3 col=a;
+    col=mix(col,c,smoothstep(.58,.66,r));
+    return col;
+  }
+  // 积水下的碎石/枕木 —— 浅层
+  float pebbles(vec2 p){ vec2 g=p*2.6,i=floor(g),f=fract(g); float md=8.;
+    for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){vec2 b=vec2(x,y); float d=length(b+hash2(i+b)-f); md=min(md,d);} return md; }
+
+  void main(){
+    vec2 p=vW.xz; float e=.03;
+    vec3 n=normalize(vec3(height(p-vec2(e,0))-height(p+vec2(e,0)), 2.*e, height(p-vec2(0,e))-height(p+vec2(0,e))));
+    vec3 V=normalize(uCam-vW);
+    float fres=.02+.98*pow(1.-max(dot(n,V),0.),5.);
+
+    // 浅水底：被水打湿的石子，水越深越透明
+    float depthMask=smoothstep(.35,.75,fbm(p*.18));         // 有的地方积水浅露出石子，有的地方深不见底
+    vec2 rp=p+n.xz*2.2;
+    float pb=pebbles(rp); float stoneN=fbm(rp*5.);
+    vec3 stone=mix(vec3(.02,.035,.06),vec3(.05,.07,.1),smoothstep(.5,.1,pb))*(.7+.4*stoneN);
+    // 深层画面带视差（深度感）
+    vec2 dp=p - V.xz/max(V.y,.2)*6. + n.xz*5.;
+    vec3 deep=under(dp)*.9;
+    vec3 below=mix(stone*mix(vec3(1.),deep*2.+.3,.35), deep, depthMask)*.8;
+    // 积水下的图片（按路程切换，淡入淡出）
+    vec2 ip=p - V.xz/max(V.y,.2)*.8 + n.xz*1.2;
+    if(uFA>.001){ vec4 a=img(uImgA,uAncA,ip,uFA); below=mix(below,a.rgb,a.a); }
+    if(uFB>.001){ vec4 b=img(uImgB,uAncB,ip,uFB); below=mix(below,b.rgb,b.a); }
+
+    // 灯笼照亮
+    vec3 L=uLamp-vW; float ld=length(L); L/=ld;
+    float atten=1./(1.+ld*ld*.55);
+    vec3 warm=vec3(1.,.66,.3);
+    below+= warm*atten*.45*(1.-depthMask*.7)*(.25+stone*2.);
+    vec3 H=normalize(L+V);
+    float spec=pow(max(dot(n,H),0.),300.)*10.*atten + pow(max(dot(n,H),0.),40.)*.3*atten;
+
+    // 反射夜空
+    vec3 R=reflect(-V,n);
+    vec3 sky=vec3(.02,.05,.14)+vec3(.05,.12,.3)*pow(1.-R.y,2.)+stars(R.xz/R.y*4.+3.,2.)*.6;
+    below=mix(below, below*vec3(.55,.75,1.)+vec3(.0,.015,.035), .45);   // 水体吸收：偏蓝变暗
+    float lr=max(dot(R,L),0.);
+    vec3 lampRefl=warm*(pow(lr,1500.)*4.+pow(lr,120.)*.3+pow(lr,14.)*.04)*atten*1.2;  // 灯笼倒影：亮核+拉长的光晕
+    vec3 moonD=normalize(vec3(-.3,1.,-.5));
+    float moonS=pow(max(dot(R,moonD),0.),3000.)*.35+pow(max(dot(R,moonD),0.),200.)*.04;
+    vec3 col=mix(below, sky, clamp(fres*1.1,0.,1.)) + warm*spec + lampRefl + vec3(.7,.85,1.)*moonS;
+    float fo=foam(p); col+= vec3(.85,.92,1.)*fo*.9 + warm*fo*atten*1.5;
+
+    // 女孩阴影
+    float sd=length(p-uGirl.xz); col*=mix(.45,1.,smoothstep(.0,.55,sd));
+    // 涟漪高光
+    col+= vec3(.5,.7,1.)*max(n.x+n.z,0.)*.35*(1.-fres);
+    gl_FragColor=vec4(col,1.);
+  }`
+});
+const water = new THREE.Mesh(new THREE.PlaneGeometry(80,80,1,1), waterMat);
+water.rotation.x = -Math.PI/2; scene.add(water);
+waterMat.depthWrite=false;   // 水面不写深度，水下倒影才能画在水面"里面"
+
+/* ---------------- 女孩（Blender 建模 + 骨骼动画，girl.glb） ---------------- */
+const girl = new THREE.Group(); scene.add(girl);
+const body = new THREE.Group(); girl.add(body);
+let mixer=null, runAct=null, idleAct=null, footL=null, footR=null, hand=null;
+const lantern=new THREE.Group(); scene.add(lantern);
+const handle=new THREE.Mesh(new THREE.TorusGeometry(.045,.005,6,16,Math.PI),new THREE.MeshStandardMaterial({color:0x222222,roughness:.4,metalness:.8}));
+lantern.add(handle);
+const lbody=new THREE.Mesh(new THREE.CylinderGeometry(.055,.065,.12,6), new THREE.MeshStandardMaterial({color:0xffcf7a,emissive:0xffa040,emissiveIntensity:2,roughness:.4}));
+lbody.position.y=-.1; lantern.add(lbody);
+const lcap=new THREE.Mesh(new THREE.ConeGeometry(.07,.04,6),new THREE.MeshStandardMaterial({color:0x1a1a1a,roughness:.5,metalness:.6})); lcap.position.y=-.03; lantern.add(lcap);
+const lamp=new THREE.PointLight(0xffa850, 6, 9, 1.6); lamp.position.y=-.1; lantern.add(lamp);
+new GLTFLoader().load('marisol.glb', g=>{
+  const m=g.scene; body.add(m);
+  m.traverse(o=>{ if(o.isMesh){ o.frustumCulled=false; if(o.material){ o.material.envMapIntensity=.5; } } });
+  const bone=n=>m.getObjectByName(n)||m.getObjectByName(n.replace('.',''));
+  footL=bone('foot_L')||bone('foot.L'); footR=bone('foot_R')||bone('foot.R'); hand=bone('hand_L')||bone('hand.L');
+  mixer=new THREE.AnimationMixer(m);
+  runAct=mixer.clipAction(g.animations.find(a=>a.name.startsWith('Run'))); idleAct=mixer.clipAction(g.animations.find(a=>a.name.startsWith('Idle')));
+  runAct.play(); idleAct.play(); runAct.setEffectiveWeight(0); idleAct.setEffectiveWeight(1);
+  m.traverse(o=>{ if(!o.isMesh) return; o.renderOrder=2;   // 她放进透明队列、排在倒影之后画，压在倒影上面
+    (Array.isArray(o.material)?o.material:[o.material]).forEach(mt=>{ mt.transparent=true; mt.depthWrite=true; }); });
+
+  // 倒影里的另一个她：同一个模型上下翻转放在水下，有自己的动画和意志
+  const rm=SkeletonUtils.clone(m); reflBody.add(rm);
+  rm.traverse(o=>{ if(!o.isMesh) return; o.renderOrder=1; o.frustumCulled=false;
+    const mats=(Array.isArray(o.material)?o.material:[o.material]).map(src=>{ const c=src.clone();
+      c.transparent=true; c.depthWrite=false; c.depthTest=false;   // 不做深度测试：保证水面下的倒影一定画得出来
+      c.opacity=1; if(c.color) c.color.lerp(new THREE.Color(0x9fd8ff),.35);
+      if(c.emissive){ c.emissive.set(0x3fb4ff); c.emissiveIntensity=1.6; if(c.emissiveMap===undefined) c.emissiveMap=null; } reflMats.push(c); return c; });
+    o.material=Array.isArray(o.material)?mats:mats[0]; });
+  reflMixer=new THREE.AnimationMixer(rm);
+  reflRun=reflMixer.clipAction(runAct.getClip()); reflIdle=reflMixer.clipAction(idleAct.getClip());
+  reflRun.play(); reflIdle.play(); reflRun.setEffectiveWeight(0); reflIdle.setEffectiveWeight(1);
+});
+const refl=new THREE.Group(); refl.scale.set(1.25,-1.25,1.25); scene.add(refl);   // 水下的她比本人大一圈，更像梦
+const reflBody=new THREE.Group(); refl.add(reflBody);
+const reflMats=[]; let reflMixer=null, reflRun=null, reflIdle=null;
+// 阶段：sync 同步 → drift 慢半拍 → stop 停下回头看你 → away 往反方向跑走、淡出 → gone → back 重新浮现
+const R={still:0,phase:'sync',pt:0,runT:0,lag:0,x:0,z:0,h:Math.PI,w:0,op:0,awayH:0};
+const hist=[];
+const hintEl=document.getElementById('hint'); let hintTxt='';
+function showHint(a,b){ const h=a+b; if(hintTxt!==h){ hintTxt=h; hintEl.innerHTML=a+'<small>'+b+'</small>'; } hintEl.classList.add('on'); }
+function hideHint(){ hintEl.classList.remove('on'); hintTxt=''; }
+if(new URLSearchParams(location.search).has('auto')) setTimeout(()=>{ R.phase='drift'; R.pt=0; },2500);   // ?auto：自动开跑并触发倒影
+addEventListener('keydown',e=>{ if(e.key==='r'||e.key==='R'){ R.phase='drift'; R.pt=0; } });   // R：立刻让倒影开始“不听话”
+function sampleHist(tt){ for(let i=hist.length-1;i>=0;i--) if(hist[i].t<=tt) return hist[i]; return hist[0]; }
+function updateReflection(dt,t,w){
+  if(!reflMixer) return;
+  hist.push({t,x:pos.x,z:pos.z,h:heading,w,lx:body.rotation.x,lz:body.rotation.z});
+  while(hist.length>2 && hist[0].t<t-3) hist.shift();
+  R.pt+=dt; const go=(p)=>{ R.phase=p; R.pt=0; };
+  let tw=w, tOp=.8, rw=w, follow=true;
+  switch(R.phase){
+    case 'sync': R.lag=Math.max(0,R.lag-dt); if(w>.6) R.runT+=dt; if(R.runT>(DEMO?5:9)) go('drift'); break;
+    case 'drift': R.lag=Math.min(.75,R.lag+dt*.2); if(R.pt>4) go('stop'); break;
+    case 'stop': follow=false; rw=0; tOp=.85;
+      { const tx=pos.x+dir.x*1.6-dir.z*.9, tz=pos.z+dir.z*1.6+dir.x*.9;   // 漂在她前方侧边，画面中间   // 被水流带着漂在她身后侧，人却不跑了
+        R.x+=(tx-R.x)*(1-Math.exp(-dt*3)); R.z+=(tz-R.z)*(1-Math.exp(-dt*3)); }
+      R.h=lerpAngle(R.h,0,1-Math.exp(-dt*2.5));            // 慢慢转身，抬头看镜头
+      if(R.pt>3.2){ R.awayH=heading+Math.PI; go('away'); } break;
+    case 'away': follow=false; rw=1; tOp=0;
+      R.h=lerpAngle(R.h,R.awayH,1-Math.exp(-dt*4));
+      R.x+=Math.sin(R.h)*MAXSPEED*.8*dt; R.z+=Math.cos(R.h)*MAXSPEED*.8*dt;
+      if(R.pt>3) go('gone'); break;
+    case 'gone': follow=false; tOp=0;   // 走丢了：要她停下来、用灯笼照一照水面，倒影才回来
+      if(R.pt>1.2) showHint('水里的她走丢了','停下来（空格），用灯笼照一照水面');
+      if(w<.05) R.still+=dt; else R.still=0;
+      if(R.still>1.2){ R.x=pos.x; R.z=pos.z; R.h=heading; addRipple(pos.x,pos.z,1.8); addRipple(pos.x,pos.z,1.1); go('back'); } break;
+    case 'back': follow=false; rw=0; tOp=.85; R.x=pos.x; R.z=pos.z;     // 从她脚下浮出来，抬头看她
+      R.h=lerpAngle(R.h,heading,1-Math.exp(-dt*3));
+      if(R.pt>.6) showHint('她回来了','继续跑吧 ↑');
+      if(R.pt>2.2 && w>.3){ hideHint(); R.lag=0; R.runT=0; go('sync'); }
+      if(R.pt>6) hideHint(); break;
+  }
+  if(follow){ const s=sampleHist(t-R.lag); R.x=pos.x-dir.z*.55+dir.x*.3; R.z=pos.z+dir.x*.55+dir.z*.3; R.h=s.h; rw=s.w;   // 位置贴着她，只有动作/朝向慢半拍
+    reflBody.rotation.x=s.lx; reflBody.rotation.z=s.lz; }
+  else { reflBody.rotation.x*=Math.exp(-dt*4); reflBody.rotation.z*=Math.exp(-dt*4); }
+  R.w+=(rw-R.w)*(1-Math.exp(-dt*5));
+  R.op+=(tOp-R.op)*(1-Math.exp(-dt*(tOp>R.op?1.2:.9)));
+  for(const c of reflMats) c.opacity=R.op;
+  refl.visible=R.op>.01;
+  // 水面轻微晃动，倒影随之扭
+  refl.position.set(R.x+Math.sin(t*1.7)*.02, 0, R.z+Math.cos(t*1.3)*.02); refl.rotation.y=R.h;
+  reflRun.setEffectiveWeight(R.w); reflIdle.setEffectiveWeight(1-R.w); reflRun.timeScale=(.7+.25*R.w)*STEP*(R.phase==='drift'?.8:1);   // 慢半拍：步子比她慢
+  if(R.phase==='sync' && R.lag<.01){ reflRun.time=runAct.time; reflIdle.time=idleAct.time; }
+  reflMixer.update(dt);
+}
+
+/* ---------------- 积水下的图片：scenes/1.jpg 2.jpg …（也支持 png / webp） ---------------- */
+const sceneTex=[]; const texLoader=new THREE.TextureLoader();
+(function loadNext(i, ei=0){ const exts=['png','jpg','webp','jpeg']; if(ei>=exts.length) return;
+  texLoader.load(`scenes/${i}.${exts[ei]}`, t=>{ t.colorSpace=THREE.SRGBColorSpace; t.anisotropy=8; sceneTex.push(t); loadNext(i+1); },
+    undefined, ()=>loadNext(i,ei+1)); })(1);
+const DEMO=new URLSearchParams(location.search).has('render');
+let imgSlot=0, imgIdx=-1, travelled=1e9; const SCREEN=DEMO?10:26;   // 大约 8~9 秒换一张
+const fade=[{v:0,to:0,delay:0},{v:0,to:0,delay:0}];
+function nextImage(){ if(!sceneTex.length) return; imgIdx=(imgIdx+1)%sceneTex.length; imgSlot^=1;
+  const u=waterMat.uniforms, anc=new THREE.Vector2(pos.x+dir.x*7,pos.z+dir.z*7);
+  if(imgSlot===0){ u.uImgA.value=sceneTex[imgIdx]; u.uAncA.value.copy(anc); fade[0].v=0; } else { u.uImgB.value=sceneTex[imgIdx]; u.uAncB.value.copy(anc); fade[1].v=0; }
+  fade[imgSlot].to=1; fade[imgSlot].delay=fade[imgSlot^1].v>.05?(DEMO?.9:2.4):0; fade[imgSlot^1].to=0; fade[imgSlot^1].delay=0; travelled=0; }
+
+/* ---------------- 水花粒子：水冠 + 飞溅水珠 + 细雾 ---------------- */
+const NP=1500, pPos=new Float32Array(NP*3), pVel=new Float32Array(NP*3), pLife=new Float32Array(NP), pSize=new Float32Array(NP), pMax=new Float32Array(NP); let pIdx=0;
+const pGeo=new THREE.BufferGeometry();
+pGeo.setAttribute('position',new THREE.BufferAttribute(pPos,3)); pGeo.setAttribute('size',new THREE.BufferAttribute(pSize,1)); pGeo.setAttribute('life',new THREE.BufferAttribute(pLife,1));
+const pMat=new THREE.ShaderMaterial({transparent:true,depthWrite:false,blending:THREE.AdditiveBlending,
+  uniforms:{uLamp:{value:new THREE.Vector3()},uScale:{value:innerHeight}},
+  vertexShader:`attribute float size,life; varying float vL; varying vec3 vW; uniform float uScale;
+    void main(){ vL=life; vec4 w=modelMatrix*vec4(position,1.); vW=w.xyz; vec4 mv=viewMatrix*w;
+      gl_PointSize=size*1.7*uScale/(-mv.z); gl_Position=projectionMatrix*mv; }`,
+  fragmentShader:`varying float vL; varying vec3 vW; uniform vec3 uLamp;
+    void main(){ vec2 c=gl_PointCoord-.5; float r=length(c); if(r>.5) discard;
+      float core=smoothstep(.5,.0,r); float hl=smoothstep(.22,.0,length(c-vec2(-.12,-.12)));
+      float a=clamp(vL,0.,1.); float lit=1./(1.+dot(uLamp-vW,uLamp-vW)*.8);
+      vec3 col=vec3(.55,.7,.95)*core*.5+vec3(1.)*hl*.9+vec3(1.,.7,.35)*lit*core*1.6;
+      gl_FragColor=vec4(col*a,a*core); }`});
+const pts=new THREE.Points(pGeo,pMat); pts.frustumCulled=false; scene.add(pts);
+function emit(x,y,z,vx,vy,vz,size,life){ const k=pIdx; pIdx=(pIdx+1)%NP;
+  pPos[k*3]=x; pPos[k*3+1]=y; pPos[k*3+2]=z; pVel[k*3]=vx; pVel[k*3+1]=vy; pVel[k*3+2]=vz; pSize[k]=size; pLife[k]=life; pMax[k]=life; }
+function splash(x,z,dir,w){
+  const fw=.6+.4*w;
+  for(let i=0;i<34;i++){ const a=i/34*Math.PI*2+Math.random()*.2, s=(.55+Math.random()*.35)*fw;   // 水冠：一圈向外向上
+    emit(x+Math.cos(a)*.05,.01,z+Math.sin(a)*.05, Math.cos(a)*s+dir.x*.5, (1.1+Math.random()*.6)*fw, Math.sin(a)*s+dir.z*.5, .022+Math.random()*.012, .55); }
+  for(let i=0;i<26;i++){ const a=Math.random()*Math.PI*2, s=Math.random()*1.4*fw;           // 甩出的大水珠（多向前后飞）
+    emit(x,.03,z, Math.cos(a)*s*.6+dir.x*(.4+Math.random()), (1.6+Math.random()*2.2)*fw, Math.sin(a)*s*.6+dir.z*(.4+Math.random()), .03+Math.random()*.03, 1); }
+  for(let i=0;i<30;i++){ const a=Math.random()*Math.PI*2, s=Math.random()*.5;                 // 细雾
+    emit(x,.02,z, Math.cos(a)*s, .3+Math.random()*.6, Math.sin(a)*s, .012, .45); }
+}
+/* ---------------- 后期：泛光 + 胶片颗粒 + 暗角 ---------------- */
+const composer=new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene,camera));
+composer.addPass(new UnrealBloomPass(new THREE.Vector2(innerWidth,innerHeight),.5,.5,.85));
+const film=new ShaderPass({uniforms:{tDiffuse:{value:null},uTime:{value:0}},
+  vertexShader:`varying vec2 vUv;void main(){vUv=uv;gl_Position=vec4(position.xy,0.,1.);}`,
+  fragmentShader:`uniform sampler2D tDiffuse;uniform float uTime;varying vec2 vUv;
+  float h(vec2 p){return fract(sin(dot(p,vec2(12.9898,78.233))+uTime*7.)*43758.5);}
+  void main(){ vec2 c=vUv-.5; float ca=.0025*length(c);
+    vec3 col=vec3(texture2D(tDiffuse,vUv-c*ca).r,texture2D(tDiffuse,vUv).g,texture2D(tDiffuse,vUv+c*ca).b);
+    col*=1.-dot(c,c)*1.25; col+=(h(vUv)-.5)*.045; gl_FragColor=vec4(col,1.);}`});
+composer.addPass(film);
+composer.addPass(new OutputPass());
+
+/* ---------------- 踩水音效（Web Audio 实时合成，无需音频文件） ---------------- */
+let AC=null, noiseBuf=null, master=null;
+function initAudio(){ if(AC){ if(AC.state==='suspended') AC.resume(); return; }
+  AC=new (window.AudioContext||window.webkitAudioContext)();
+  master=AC.createGain(); master.gain.value=.8;
+  const comp=AC.createDynamicsCompressor(); master.connect(comp); comp.connect(AC.destination);
+  window.__audioDest=AC.createMediaStreamDestination(); comp.connect(window.__audioDest);
+  noiseBuf=AC.createBuffer(1,AC.sampleRate*1,AC.sampleRate); const d=noiseBuf.getChannelData(0);
+  for(let i=0;i<d.length;i++) d[i]=Math.random()*2-1; }
+addEventListener('keydown',initAudio); addEventListener('pointerdown',initAudio);
+function noiseHit(t,dur,f,q,gain,type='bandpass',fEnd){ const src=AC.createBufferSource(); src.buffer=noiseBuf;
+  src.playbackRate.value=.8+Math.random()*.4;
+  const bp=AC.createBiquadFilter(); bp.type=type; bp.frequency.setValueAtTime(f,t); if(fEnd) bp.frequency.exponentialRampToValueAtTime(fEnd,t+dur); bp.Q.value=q;
+  const g=AC.createGain(); g.gain.setValueAtTime(0,t); g.gain.linearRampToValueAtTime(gain,t+.004); g.gain.exponentialRampToValueAtTime(.0008,t+dur);
+  src.connect(bp); bp.connect(g); g.connect(master); src.start(t,Math.random()*.5); src.stop(t+dur+.05); }
+function bubble(t,f,gain){ const o=AC.createOscillator(); o.type='sine';
+  o.frequency.setValueAtTime(f,t); o.frequency.exponentialRampToValueAtTime(f*1.9,t+.05);   // 水泡上升的“啵”
+  const g=AC.createGain(); g.gain.setValueAtTime(0,t); g.gain.linearRampToValueAtTime(gain,t+.003); g.gain.exponentialRampToValueAtTime(.0005,t+.07);
+  o.connect(g); g.connect(master); o.start(t); o.stop(t+.09); }
+const audioEvents=[];
+function playSplash(w, at){ if(RENDER&&at===undefined){ audioEvents.push(['s',simT,w]); return; } if(!AC||(AC.state!=='running'&&at===undefined)) return; const t=(at??AC.currentTime)+.005, v=.35+.65*w;
+  noiseHit(t,.06,260,1.2,.55*v,'lowpass',120);              // 脚掌拍水的闷响
+  noiseHit(t,.22,2600,.9,.32*v,'bandpass',900);             // 水花“哗”
+  noiseHit(t+.01,.35,6500,.7,.10*v,'highpass');             // 细碎水珠嘶声
+  for(let i=0;i<3+Math.floor(Math.random()*3);i++) bubble(t+.03+Math.random()*.12, 500+Math.random()*900, .05*v);
+  for(let i=0;i<4;i++) noiseHit(t+.18+Math.random()*.35,.05,3000+Math.random()*3000,6,.04*v);  // 水珠落回的滴答
+}
+function playDrip(at){ if(RENDER&&at===undefined){ audioEvents.push(['d',simT]); return; } if(!AC||(AC.state!=='running'&&at===undefined)) return; const t=at??AC.currentTime; bubble(t,900+Math.random()*700,.025); noiseHit(t,.04,4000,8,.015); }
+
+/* ---------------- 控制：↑ 起跑 / 方向键转向 / 鼠标指方向，空格停下 ---------------- */
+const mouse=new THREE.Vector2(), ray=new THREE.Raycaster(), ground=new THREE.Plane(new THREE.Vector3(0,1,0),0);
+const target=new THREE.Vector3(); let mode='none', running=new URLSearchParams(location.search).has('auto'); const keys={};
+function hideTip(){ document.getElementById('tip').style.opacity=0; }
+addEventListener('pointermove',e=>{ mouse.set(e.clientX/innerWidth*2-1, -(e.clientY/innerHeight)*2+1);
+  if(Math.abs(e.movementX)+Math.abs(e.movementY)>0){ mode='mouse'; running=true; hideTip(); } });
+addEventListener('keydown',e=>{
+  if(e.key.startsWith('Arrow')){ keys[e.key]=1; mode='key'; running=true; e.preventDefault(); hideTip(); }
+  if(e.key===' '){ running=false; e.preventDefault(); } });
+addEventListener('keyup',e=>{ keys[e.key]=0; });
+addEventListener('blur',()=>{ for(const k in keys) keys[k]=0; });
+let heading=Math.PI, targetHeading=Math.PI, speed=0; const MAXSPEED=3.5; const STEP=1.35;   // 动作整体加快 35%，速度同步放大，脚不打滑
+let lean=0, prevSpeed=0;   // 与动捕跑步的步幅一致，脚不打滑
+const pos=new THREE.Vector3(), dir=new THREE.Vector3(0,0,-1);
+let prevFL=1, prevFR=1;
+
+const clock=new THREE.Clock();
+const tmp=new THREE.Vector3(), tq=new THREE.Quaternion(), camPos=new THREE.Vector3(0,8.5,1.4);
+function lerpAngle(a,b,t){ let d=((b-a+Math.PI)%(Math.PI*2)+Math.PI*2)%(Math.PI*2)-Math.PI; return a+d*t; }
+
+function step(dt){
+  simT+=dt; const t=simT;
+  if(RENDER) demoControl(simT);
+  if(mode==='mouse'){
+    ray.setFromCamera(mouse,camera);
+    if(ray.ray.intersectPlane(ground,target)){ const dx=target.x-pos.x, dz=target.z-pos.z;
+      if(Math.hypot(dx,dz)>.6) targetHeading=Math.atan2(dx,dz); }
+  } else if(mode==='key'){
+    const kx=(keys.ArrowRight?1:0)-(keys.ArrowLeft?1:0), kz=(keys.ArrowDown?1:0)-(keys.ArrowUp?1:0);
+    if(kx||kz) targetHeading=Math.atan2(kx,kz);
+  }
+  const want=running?MAXSPEED:0;
+  speed+= (want-speed)*(1-Math.exp(-dt*(want>speed?3.5:5)));
+  if(speed<.02) speed=0;
+  const turn=lerpAngle(0,targetHeading-heading,1);
+  heading=lerpAngle(heading,targetHeading,1-Math.exp(-dt*(3+speed*1.5)));
+  dir.set(Math.sin(heading),0,Math.cos(heading));
+  pos.addScaledVector(dir,speed*dt);
+  travelled+=speed*dt; if(travelled>SCREEN) nextImage();
+  for(const f of fade){ if(f.delay>0){ f.delay-=dt; continue; } const r=(f.to>f.v?.45:.6)*(DEMO?1.6:1); f.v=f.to>f.v?Math.min(1,f.v+dt*r):Math.max(0,f.v-dt*r); }
+  waterMat.uniforms.uFA.value=fade[0].v; waterMat.uniforms.uFB.value=fade[1].v;
+  girl.position.copy(pos); girl.rotation.y=heading; rim.target.position.copy(pos); rim.position.copy(pos).add(new THREE.Vector3(2,6,-5));
+  body.rotation.z+=(THREE.MathUtils.clamp(-turn*.28,-.3,.3)*(speed/MAXSPEED)-body.rotation.z)*(1-Math.exp(-dt*6));  // 转弯侧倾（有惯性）
+  const acc=(speed-prevSpeed)/Math.max(dt,1e-3); prevSpeed=speed;
+  lean+=((.12*speed/MAXSPEED+acc*.03)-lean)*(1-Math.exp(-dt*5)); body.rotation.x=THREE.MathUtils.clamp(lean,-.15,.3);  // 前倾：越快越倾，起跑猛冲、刹车后仰
+
+  const w=speed/MAXSPEED;
+  if(mixer){ runAct.setEffectiveWeight(w); idleAct.setEffectiveWeight(1-w); runAct.timeScale=(.7+.25*w)*STEP; mixer.update(dt); }
+  girl.updateMatrixWorld(true);
+  updateReflection(dt,t,w);
+
+  // 灯笼挂在左手，始终保持竖直并轻轻晃
+  if(hand){ hand.getWorldPosition(tmp); lantern.position.copy(tmp).add(new THREE.Vector3(0,-.02,0));
+    lantern.rotation.set(Math.sin(t*5)*.15*w+Math.sin(t*1.3)*.04, heading, Math.cos(t*4)*.1*w); }
+
+  // 落脚 -> 涟漪 + 水花
+  for(const [f,side] of [[footL,'L'],[footR,'R']]){ if(!f) continue;
+    f.getWorldPosition(tmp); const prev=side==='L'?prevFL:prevFR;
+    if(prev>.15 && tmp.y<=.15 && w>.3){ addRipple(tmp.x,tmp.z,1.3*w); splash(tmp.x,tmp.z,dir,w); playSplash(w); }
+    if(side==="L") prevFL=tmp.y; else prevFR=tmp.y; }
+  if(Math.random()<dt*.6){ addRipple(pos.x+(Math.random()-.5)*14,pos.z+(Math.random()-.5)*14,.35); playDrip(); } // 远处滴水
+  if(w<.05 && Math.random()<dt*.5) addRipple(pos.x+(Math.random()-.5)*.3,pos.z+(Math.random()-.5)*.3,.15); // 站着时脚下微动
+
+  let dropRip=0;
+  for(let i=0;i<NP;i++){ if(pLife[i]<=0){ pPos[i*3+1]=-5; continue; }
+    pLife[i]-=dt; pVel[i*3+1]-=9.8*dt; const drag=Math.exp(-dt*1.2);
+    pVel[i*3]*=drag; pVel[i*3+2]*=drag;
+    pPos[i*3]+=pVel[i*3]*dt; pPos[i*3+1]+=pVel[i*3+1]*dt; pPos[i*3+2]+=pVel[i*3+2]*dt;
+    if(pPos[i*3+1]<=0 && pVel[i*3+1]<0){ pLife[i]=0;                                     // 水珠落回水面 -> 小涟漪
+      if(pSize[i]>.04 && dropRip<2){ addRipple(pPos[i*3],pPos[i*3+2],.22); dropRip++; } } }
+  pGeo.attributes.size.needsUpdate=true; pGeo.attributes.life.needsUpdate=true;
+  pGeo.attributes.position.needsUpdate=true;
+
+  // 相机：俯视、略带呼吸感，前方留白
+  tmp.set(pos.x+dir.x*1.2*w+Math.sin(t*.3)*.15, 6.2, pos.z+dir.z*1.0*w+4.2);
+  camPos.lerp(tmp,1-Math.exp(-dt*4)); camera.position.copy(camPos);
+  camera.lookAt(camPos.x,.5,camPos.z-4.2);
+  water.position.set(Math.round(pos.x),0,Math.round(pos.z));
+
+  lamp.getWorldPosition(tmp); pMat.uniforms.uLamp.value.copy(tmp);
+  const u=waterMat.uniforms; u.uTime.value=t; u.uLamp.value.copy(tmp); u.uGirl.value.copy(pos); u.uCam.value.copy(camera.position);
+  lamp.intensity=6+Math.sin(t*9)*.3+Math.sin(t*23)*.2;
+  film.uniforms.uTime.value=t;
+}
+function animate(){ if(RENDER) return; step(Math.min(clock.getDelta(),.05)); composer.render(); requestAnimationFrame(animate); }
+
+/* ---------------- 离线逐帧渲染：?render  自动演示，逐帧出图 + 离线合成音效，保存到 recordings/ ---------------- */
+const FPS=30, DUR=28;
+let demoState=0;
+function demoControl(T){
+  const go=h=>{ targetHeading=h; running=true; mode='key'; };
+  // 倒影戏：约6s开始慢半拍 → 10s停下回头 → 13s反向跑开 → 16s消失 → 19s浮回同步
+  const steps=[[0.8,()=>go(Math.PI)],[8.0,()=>go(Math.PI*.85)],[12.5,()=>go(Math.PI*.62)],
+               [17.5,()=>{running=false;}],[22.5,()=>go(Math.PI*.9)],[27.0,()=>{running=false;}]];
+  while(demoState<steps.length && T>=steps[demoState][0]){ steps[demoState][1](); demoState++; }
+}
+const post=(name,body)=>fetch('/save?name='+encodeURIComponent(name),{method:'POST',body});
+function wav(buf){ const n=buf.length, ch=buf.numberOfChannels, sr=buf.sampleRate, b=new DataView(new ArrayBuffer(44+n*ch*2));
+  const w=(o,str)=>{ for(let i=0;i<str.length;i++) b.setUint8(o+i,str.charCodeAt(i)); };
+  w(0,'RIFF'); b.setUint32(4,36+n*ch*2,true); w(8,'WAVE'); w(12,'fmt '); b.setUint32(16,16,true); b.setUint16(20,1,true); b.setUint16(22,ch,true);
+  b.setUint32(24,sr,true); b.setUint32(28,sr*ch*2,true); b.setUint16(32,ch*2,true); b.setUint16(34,16,true); w(36,'data'); b.setUint32(40,n*ch*2,true);
+  const d=[...Array(ch)].map((_,c)=>buf.getChannelData(c)); let o=44;
+  for(let i=0;i<n;i++) for(let c=0;c<ch;c++){ const v=Math.max(-1,Math.min(1,d[c][i])); b.setInt16(o,v*32767,true); o+=2; }
+  return new Blob([b],{type:'audio/wav'}); }
+let hintOp=0, cmp=null;
+async function renderAll(){
+  document.getElementById('tip').style.display='none'; document.getElementById('legal').style.display='none';
+  renderer.setPixelRatio(1); renderer.setSize(1920,1080); composer.setSize(1920,1080);
+  camera.aspect=16/9; camera.updateProjectionMatrix(); pMat.uniforms.uScale.value=1080;
+  while(!mixer || sceneTex.length<10) await new Promise(r=>setTimeout(r,200));
+  const N=Math.round(DUR*FPS);
+  for(let f=0; f<N; f++){
+    step(1/FPS); composer.render();
+    // 浮层提示录进视频：把文字画到合成画布上
+    hintOp+=((hintEl.classList.contains('on')?.92:0)-hintOp)*(1-Math.exp(-1/FPS*3));
+    let src=renderer.domElement;
+    if(hintOp>.01){ if(!cmp){ cmp=document.createElement('canvas'); cmp.width=1920; cmp.height=1080; }
+      const g=cmp.getContext('2d'); g.drawImage(src,0,0); g.save(); g.globalAlpha=hintOp; g.textAlign='center';
+      g.shadowColor='rgba(80,170,255,.85)'; g.shadowBlur=28; g.fillStyle='#d8ecff';
+      const [a,b]=[hintEl.firstChild?hintEl.firstChild.textContent:'', hintEl.querySelector('small')?hintEl.querySelector('small').textContent:''];
+      g.font="500 44px 'PingFang SC',sans-serif"; g.letterSpacing='8px'; g.fillText(a,960,170);
+      g.globalAlpha=hintOp*.7; g.font="400 26px 'PingFang SC',sans-serif"; g.letterSpacing='8px'; g.fillText(b,960,222); g.restore(); src=cmp; }
+    const blob=await new Promise(r=>src.toBlob(r,'image/jpeg',.93));
+    await post('f'+String(f).padStart(5,'0')+'.jpg', blob);
+    document.title='frame '+f+'/'+N;
+  }
+  // 离线合成音效：在同样的时间点重放踩水声
+  AC=new OfflineAudioContext(2,Math.ceil(48000*DUR),48000);
+  master=AC.createGain(); master.gain.value=.8; const comp=AC.createDynamicsCompressor(); master.connect(comp); comp.connect(AC.destination);
+  noiseBuf=AC.createBuffer(1,AC.sampleRate,AC.sampleRate); const nd=noiseBuf.getChannelData(0); for(let i=0;i<nd.length;i++) nd[i]=Math.random()*2-1;
+  for(const e of audioEvents){ if(e[0]==='s') playSplash(e[2],e[1]); else playDrip(e[1]); }
+  await post('audio.wav', wav(await AC.startRendering()));
+  document.title='DONE '+audioEvents.length;
+}
+const RENDER=new URLSearchParams(location.search).has('render');
+if(RENDER) renderAll();
+animate();
+addEventListener('resize',()=>{ pMat.uniforms.uScale.value=innerHeight; camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth,innerHeight); composer.setSize(innerWidth,innerHeight); });
+</script>
+</body>
+</html>
